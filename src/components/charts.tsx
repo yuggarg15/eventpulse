@@ -18,3 +18,12 @@ export function TrendChart({ data }: { data: { date: string; registrations: numb
     </ResponsiveContainer>
   );
 }
+
+export function FunnelChart({ data }: { data: { stage: string; value: number }[] }) {
+  return (
+    <ResponsiveContainer width="100%" height={220}>
+      <BarChart data={data} layout="vertical" margin={{ left: 20 }}><CartesianGrid strokeDasharray="3 3" /><XAxis type="number" allowDecimals={false} fontSize={12} /><YAxis type="category" dataKey="stage" fontSize={12} width={110} /><Tooltip />
+        <Bar dataKey="value" fill="#6366f1" name="Count" radius={[0, 4, 4, 0]} /></BarChart>
+    </ResponsiveContainer>
+  );
+}

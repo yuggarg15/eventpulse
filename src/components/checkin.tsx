@@ -18,7 +18,33 @@ export function CheckIn({ eventId, attendees, confirmed }: { eventId: string; at
   const [manualToken, setManualToken] = useState("");
   const checked = attendees.filter((a) => a.checkedIn).length;
 
-  const handle = async (p: Promise<CheckInResult>) => { const r = await p; setResult(r); if (r.kind === "success") router.refresh(); return r; };
+  const [queued, setQueued] = useState(0);
+  const QKEY = `ep_scan_queue_${eventId}`;
+  const readQ = (): string[] => { try { return JSON.parse(localStorage.getItem(QKEY) || "[]"); } catch { return []; } };
+  const writeQ = (q: string[]) => { try { localStorage.setItem(QKEY, JSON.stringify(q)); } catch {} setQueued(q.length); };
+
+  // Scans made while offline are kept on this device and sent when the connection returns.
+  async function flush() {
+    const q = readQ(); if (!q.length) return;
+    const rest: string[] = [];
+    for (const t of q) { try { await checkInByScan(eventId, t); } catch { rest.push(t); } }
+    writeQ(rest); router.refresh();
+  }
+  useEffect(() => {
+    const t0 = setTimeout(flush, 0);
+    window.addEventListener("online", flush);
+    const poll = setInterval(() => { if (navigator.onLine) router.refresh(); }, 10000); // live count
+    return () => { clearTimeout(t0); window.removeEventListener("online", flush); clearInterval(poll); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handle = async (p: Promise<CheckInResult>, raw?: string) => {
+    try { const r = await p; setResult(r); if (r.kind === "success") router.refresh(); return r; }
+    catch {
+      if (raw) { writeQ([...readQ(), raw]); setResult({ kind: "duplicate", message: "No connection. Scan saved on this device and will be checked in when you are back online." }); }
+      else setResult({ kind: "error", message: "No connection. Try again." });
+    }
+  };
 
   async function start() {
     setCamError(""); setScanning(true);
@@ -28,7 +54,7 @@ export function CheckIn({ eventId, attendees, confirmed }: { eventId: string; at
       const controls = await reader.decodeFromVideoDevice(undefined, video.current!, async (res) => {
         if (!res || busy.current) return;
         busy.current = true;
-        await handle(checkInByScan(eventId, res.getText()));
+        await handle(checkInByScan(eventId, res.getText()), res.getText());
         setTimeout(() => { busy.current = false; }, 2500); // avoid re-reading the same code instantly
       });
       stopRef.current = () => controls.stop();
@@ -51,6 +77,7 @@ export function CheckIn({ eventId, attendees, confirmed }: { eventId: string; at
         <div><p className="text-xs font-medium uppercase text-slate-500">Checked in</p><p className="text-3xl font-semibold">{checked} <span className="text-lg text-slate-400">/ {confirmed}</span></p></div>
         {scanning ? <button className="btn-ghost" onClick={stop}>Stop camera</button> : <button className="btn" onClick={start}><Camera size={16} /> Start scanning</button>}
       </div>
+      {queued > 0 && <p className="rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">{queued} scan(s) waiting to sync. They will be sent automatically when you are online.</p>}
       {camError && <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{camError}</p>}
       <div className={scanning ? "card p-2" : "hidden"}><video ref={video} className="mx-auto aspect-square w-full max-w-sm rounded-lg bg-black object-cover" muted playsInline /></div>
       {result && (
@@ -72,7 +99,7 @@ export function CheckIn({ eventId, attendees, confirmed }: { eventId: string; at
         <div className="border-t border-slate-100 pt-3">
           <p className="mb-1 text-xs text-slate-500">Or paste a ticket link / code</p>
           <div className="flex gap-2"><input className="input" value={manualToken} onChange={(e) => setManualToken(e.target.value)} />
-            <button className="btn-ghost" onClick={() => manualToken && handle(checkInByScan(eventId, manualToken))}>Check in</button></div>
+            <button className="btn-ghost" onClick={() => manualToken && handle(checkInByScan(eventId, manualToken), manualToken)}>Check in</button></div>
         </div>
       </div>
     </div>

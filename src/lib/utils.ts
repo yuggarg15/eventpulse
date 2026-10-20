@@ -39,6 +39,8 @@ export function buildUtmUrl(base: string, utm: Record<string, string | null | un
   return u.toString();
 }
 
+export const daysUntil = (iso: string) => (new Date(iso).getTime() - Date.now()) / 86400e3;
+
 export const normalizeUtm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, "_");
 
 export const CHANNELS: Record<string, { source: string; medium: string }> = {

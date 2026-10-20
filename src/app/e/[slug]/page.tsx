@@ -6,8 +6,9 @@ import { attrCookie, clickIsAttributable } from "@/lib/attribution";
 import { fmtDate } from "@/lib/utils";
 import { RegisterForm } from "@/components/register-form";
 
-export default async function PublicEvent({ params }: PageProps<"/e/[slug]">) {
+export default async function PublicEvent({ params, searchParams }: PageProps<"/e/[slug]">) {
   const { slug } = await params;
+  const refParam = String((await searchParams).ref ?? "");
   const db = admin();
   const { data: ev } = await db.from("events").select("*").eq("slug", slug).maybeSingle();
   if (!ev) notFound();
@@ -35,7 +36,7 @@ export default async function PublicEvent({ params }: PageProps<"/e/[slug]">) {
   const message = ev.status === "cancelled" ? "This event has been cancelled."
     : ev.status === "completed" || ev.status === "archived" ? "This event has ended."
     : ev.status === "draft" ? "Preview only — this event is not published yet."
-    : full ? "This event is full." : !open ? "Registration has closed." : null;
+    : full && !ev.waitlist_enabled ? "This event is full." : !open ? "Registration has closed." : null;
 
   return (
     <main className="mx-auto w-full max-w-3xl flex-1 space-y-5 p-4 md:p-8">
@@ -53,7 +54,7 @@ export default async function PublicEvent({ params }: PageProps<"/e/[slug]">) {
       </div>
       {ev.description && <p className="whitespace-pre-wrap text-slate-700">{ev.description}</p>}
       {message ? <div className="card text-center font-medium">{message}</div>
-        : <RegisterForm slug={ev.slug} askPhone={ev.ask_phone} questions={ev.custom_questions ?? []} />}
+        : <RegisterForm slug={ev.slug} askPhone={ev.ask_phone} questions={ev.custom_questions ?? []} waitlist={full} refCode={/^[a-f0-9]{8}$/.test(refParam) ? refParam : undefined} />}
     </main>
   );
 }

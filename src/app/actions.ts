@@ -4,6 +4,9 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { admin, authClient, requireEvent, requireUser, type Question } from "@/lib/supabase";
+import { deliver, runAutomations } from "@/lib/automations";
+import { AUTOMATION_KINDS, type AutomationKind } from "@/lib/automation-defaults";
+import { emailHtml, render, sendEmail } from "@/lib/email";
 import { attrCookie, clickIsAttributable } from "@/lib/attribution";
 import { extractToken } from "@/lib/ticket";
 import { istToIso, normalizeUtm, randomCode, randomToken, slugify } from "@/lib/utils";
@@ -75,16 +78,30 @@ export async function saveEvent(_: State, f: FormData): Promise<State> {
     questions.push({ id: "q2", label: q2, type: "choice", options: opts, required: f.get("q2_required") === "on" });
   }
 
+  let banner_url = p.data.banner_url || null;
+  const file = f.get("banner");
+  if (file instanceof File && file.size > 0) {
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) return { error: "Banner must be a PNG, JPG or WebP image." };
+    if (file.size > 3 * 1024 * 1024) return { error: "Banner must be under 3 MB." };
+    const db0 = admin();
+    await db0.storage.createBucket("banners", { public: true }); // no-op error if it already exists
+    const path = `${user.id}/${Date.now()}.${file.type.split("/")[1]}`;
+    const { error: upErr } = await db0.storage.from("banners").upload(path, file, { contentType: file.type });
+    if (upErr) return { error: "Could not upload the banner. Try again or paste an image URL." };
+    banner_url = db0.storage.from("banners").getPublicUrl(path).data.publicUrl;
+  }
   const row = {
-    ...p.data, banner_url: p.data.banner_url || null, venue: p.data.venue || null, meeting_link: p.data.meeting_link || null,
+    ...p.data, banner_url, waitlist_enabled: f.get("waitlist_enabled") === "on",
+    organizer_name: str(f, "organizer_name") || null, certificate_text: str(f, "certificate_text") || null, venue: p.data.venue || null, meeting_link: p.data.meeting_link || null,
     starts_at, ends_at, registration_closes_at: closes, capacity, ask_phone: f.get("ask_phone") === "on", custom_questions: questions,
   };
   const db = admin();
   let eventId = id;
   if (id) {
     await requireEvent(id);
-    const { error } = await db.from("events").update(row).eq("id", id).eq("owner_id", user.id);
+    const { error } = await db.from("events").update(row).eq("id", id);
     if (error) return { error: error.code === "23505" ? "That slug is already taken." : "Could not save event." };
+    await promoteAndNotify(id); // a higher capacity may free spots for the waitlist
   } else {
     const { data, error } = await db.from("events").insert({ ...row, owner_id: user.id }).select("id").single();
     if (error) return { error: error.code === "23505" ? "That slug is already taken." : "Could not save event." };
@@ -95,9 +112,9 @@ export async function saveEvent(_: State, f: FormData): Promise<State> {
 }
 
 export async function setEventStatus(eventId: string, status: string) {
-  const { user } = await requireEvent(eventId);
+  await requireEvent(eventId);
   if (!["draft", "published", "cancelled", "completed", "archived"].includes(status)) return;
-  await admin().from("events").update({ status }).eq("id", eventId).eq("owner_id", user.id);
+  await admin().from("events").update({ status }).eq("id", eventId);
   revalidatePath("/dashboard", "layout");
 }
 
@@ -134,6 +151,7 @@ export async function setCampaignStatus(eventId: string, linkId: string, status:
 
 /* ---------- public registration ---------- */
 export async function register(slug: string, _: State, f: FormData): Promise<State> {
+  if (str(f, "website")) return { ok: "Thanks!" }; // honeypot: real people never fill this hidden field
   const db = admin();
   const { data: ev } = await db.from("events").select("*").eq("slug", slug).maybeSingle();
   if (!ev || ev.status !== "published") return { error: "This event is not open for registration." };
@@ -172,6 +190,7 @@ export async function register(slug: string, _: State, f: FormData): Promise<Sta
     p_event_id: ev.id, p_name: base.data.name, p_email: base.data.email, p_phone: phone || null, p_answers: answers,
     p_token: randomToken(), p_link_id: link_id, p_click_id: click_id,
     p_utm_source: utm.utm_source, p_utm_medium: utm.utm_medium, p_utm_campaign: utm.utm_campaign, p_utm_content: utm.utm_content,
+    p_ref_code: randomToken(4), p_referrer_code: /^[a-f0-9]{8}$/.test(str(f, "ref")) ? str(f, "ref") : null,
   });
   if (error) return { error: "Something went wrong. Please try again." };
   const msg: Record<string, string> = {
@@ -179,6 +198,9 @@ export async function register(slug: string, _: State, f: FormData): Promise<Sta
     duplicate: "This email is already registered for this event.", full: "Sorry, this event is full.",
   };
   if (data?.error) return { error: msg[data.error] ?? "Could not register." };
+  if (data.status === "confirmed") {
+    await deliver(ev, "confirmation", { id: data.id, name: base.data.name, email: base.data.email, ticket_token: data.token, status: "confirmed" }, base.data.email, ev.organizer_name ?? "the organiser");
+  }
   redirect(`/ticket/${data.token}`);
 }
 
@@ -186,7 +208,18 @@ export async function register(slug: string, _: State, f: FormData): Promise<Sta
 export async function cancelRegistration(eventId: string, regId: string) {
   await requireEvent(eventId);
   await admin().from("event_registrations").update({ status: "cancelled" }).eq("id", regId).eq("event_id", eventId);
+  await promoteAndNotify(eventId);
   revalidatePath(`/dashboard/events/${eventId}/registrations`);
+}
+
+// Moves waitlisted people up when spots are free (oldest first) and emails them.
+async function promoteAndNotify(eventId: string) {
+  const db = admin();
+  const { data: ids } = await db.rpc("promote_waitlist", { p_event_id: eventId });
+  if (!ids?.length) return;
+  const { data: ev } = await db.from("events").select("*").eq("id", eventId).single();
+  const { data: regs } = await db.from("event_registrations").select("id,name,email,ticket_token,status").in("id", ids);
+  for (const r of regs ?? []) await deliver(ev, "waitlist_promoted", r, r.email, ev.organizer_name ?? "the organiser");
 }
 
 /* ---------- check-in ---------- */
@@ -208,7 +241,7 @@ async function doCheckIn(eventId: string, userId: string, reg: { id: string; nam
 }
 
 export async function checkInByScan(eventId: string, scanned: string): Promise<CheckInResult> {
-  const { user } = await requireEvent(eventId);
+  const { user } = await requireEvent(eventId, true);
   const token = extractToken(scanned);
   if (!token) return { kind: "error", message: "That QR code is not an EventPulse ticket." };
   const { data } = await admin().from("event_registrations").select("id,name,event_id,status").eq("ticket_token", token).maybeSingle();
@@ -216,7 +249,98 @@ export async function checkInByScan(eventId: string, scanned: string): Promise<C
 }
 
 export async function checkInById(eventId: string, regId: string): Promise<CheckInResult> {
-  const { user } = await requireEvent(eventId);
+  const { user } = await requireEvent(eventId, true);
   const { data } = await admin().from("event_registrations").select("id,name,event_id,status").eq("id", regId).eq("event_id", eventId).maybeSingle();
   return doCheckIn(eventId, user.id, data);
+}
+
+/* ---------- automations & messaging ---------- */
+export async function saveAutomation(eventId: string, kind: string, _: State, f: FormData): Promise<State> {
+  await requireEvent(eventId);
+  if (!AUTOMATION_KINDS.includes(kind as AutomationKind)) return { error: "Unknown automation." };
+  const subject = str(f, "subject"), body = str(f, "body");
+  if (!subject || !body) return { error: "Subject and message are required." };
+  const offset = Math.max(0, Math.min(720, parseInt(str(f, "offset_hours") || "0", 10) || 0));
+  await admin().from("event_automations").update({ subject: subject.slice(0, 200), body: body.slice(0, 3000), offset_hours: offset, enabled: f.get("enabled") === "on" }).eq("event_id", eventId).eq("kind", kind);
+  revalidatePath(`/dashboard/events/${eventId}/automations`);
+  return { ok: "Saved." };
+}
+
+export async function runNow(eventId: string): Promise<State> {
+  await requireEvent(eventId);
+  const r = await runAutomations(eventId);
+  revalidatePath(`/dashboard/events/${eventId}/automations`);
+  return { ok: `Run complete: ${r.sent} sent, ${r.failed} not delivered.` };
+}
+
+export async function sendBroadcast(eventId: string, _: State, f: FormData): Promise<State> {
+  const { event } = await requireEvent(eventId);
+  const subject = str(f, "subject"), body = str(f, "body"), who = str(f, "who");
+  if (!subject || !body) return { error: "Subject and message are required." };
+  const db = admin();
+  const { data: regs } = await db.from("event_registrations").select("id,email,name").eq("event_id", eventId).eq("status", "confirmed");
+  const { data: cis } = await db.from("event_check_ins").select("registration_id").eq("event_id", eventId);
+  const checked = new Set((cis ?? []).map((c) => c.registration_id));
+  const list = (regs ?? []).filter((r) => who === "all" || (who === "attended" ? checked.has(r.id) : !checked.has(r.id))).slice(0, 100);
+  if (!list.length) return { error: "No attendees match that audience." };
+  let sent = 0, failed = 0;
+  for (const r of list) {
+    const vars = { name: r.name, event: event.title };
+    const subj = render(subject, vars);
+    const res = await sendEmail(r.email, subj, emailHtml({ body: render(body, vars), footer: `You received this because you registered for ${event.title}.` }));
+    await db.from("email_log").insert({ event_id: eventId, registration_id: null, kind: "broadcast", to_email: r.email, subject: subj, status: res.status, error: res.error ?? null });
+    if (res.status === "sent") sent++; else failed++;
+  }
+  revalidatePath(`/dashboard/events/${eventId}/automations`);
+  return failed && !sent ? { error: `No emails were delivered (${failed} failed). See the email log below.` } : { ok: `${sent} sent${failed ? `, ${failed} failed` : ""}.` };
+}
+
+/* ---------- feedback ---------- */
+export async function submitFeedback(token: string, _: State, f: FormData): Promise<State> {
+  const rating = parseInt(str(f, "rating"), 10);
+  if (!(rating >= 1 && rating <= 5)) return { error: "Please choose a rating." };
+  const db = admin();
+  const { data: reg } = await db.from("event_registrations").select("id,event_id,status").eq("ticket_token", token).maybeSingle();
+  if (!reg || reg.status !== "confirmed") return { error: "Invalid feedback link." };
+  const { error } = await db.from("event_feedback").upsert({ event_id: reg.event_id, registration_id: reg.id, rating, comment: str(f, "comment").slice(0, 1000) || null }, { onConflict: "registration_id" });
+  return error ? { error: "Could not save feedback." } : { ok: "Thank you for your feedback!" };
+}
+
+/* ---------- team ---------- */
+export async function addMember(eventId: string, _: State, f: FormData): Promise<State> {
+  const { event, role: myRole } = await requireEvent(eventId);
+  if (myRole !== "owner") return { error: "Only the event owner can manage the team." };
+  const email = str(f, "email").toLowerCase(), role = str(f, "role");
+  if (!["organiser", "staff"].includes(role)) return { error: "Choose a role." };
+  const { data } = await admin().auth.admin.listUsers({ page: 1, perPage: 1000 });
+  const target = data.users.find((u) => u.email?.toLowerCase() === email);
+  if (!target) return { error: "No EventPulse account with that email. Ask them to sign up first." };
+  if (target.id === event.owner_id) return { error: "That's the owner." };
+  const { error } = await admin().from("event_members").upsert({ event_id: eventId, user_id: target.id, role }, { onConflict: "event_id,user_id" });
+  if (error) return { error: "Could not add member." };
+  revalidatePath(`/dashboard/events/${eventId}/team`);
+  return { ok: `${email} added as ${role}.` };
+}
+
+export async function removeMember(eventId: string, memberId: string) {
+  const { role } = await requireEvent(eventId);
+  if (role !== "owner") return;
+  await admin().from("event_members").delete().eq("id", memberId).eq("event_id", eventId);
+  revalidatePath(`/dashboard/events/${eventId}/team`);
+}
+
+/* ---------- misc ---------- */
+export async function duplicateEvent(eventId: string) {
+  const { event, user } = await requireEvent(eventId);
+  const { id: _id, owner_id: _o, ...rest } = event;
+  void _id; void _o;
+  const { data } = await admin().from("events").insert({ ...rest, owner_id: user.id, title: `${event.title} (copy)`, slug: `${event.slug}-${randomCode(4)}`, status: "draft" }).select("id").single();
+  if (data) redirect(`/dashboard/events/${data.id}/edit`);
+}
+
+export async function saveProfile(_: State, f: FormData): Promise<State> {
+  const user = await requireUser();
+  const display_name = str(f, "display_name").slice(0, 80);
+  const { error } = await admin().auth.admin.updateUserById(user.id, { user_metadata: { ...user.user_metadata, display_name } });
+  return error ? { error: "Could not save." } : { ok: "Profile saved." };
 }

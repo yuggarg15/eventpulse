@@ -50,7 +50,8 @@ export function summarize(links: Pick<Link, "id" | "name" | "channel">[], clicks
   checkins.filter((c) => confirmed.some((r) => r.id === c.registration_id)).forEach((c) => bump(c.created_at, "checkins"));
 
   return {
-    clicks: totalClicks, visits: views.length, confirmed: confirmed.length, cancelled: regs.length - confirmed.length,
+    clicks: totalClicks, visits: views.length, confirmed: confirmed.length, cancelled: regs.filter((r) => r.status === "cancelled").length,
+    waitlisted: regs.filter((r) => r.status === "waitlisted").length,
     checkedIn: confirmedChecked.length, attributed, direct,
     clickToReg: pct(attributed, totalClicks), attendance: pct(confirmedChecked.length, confirmed.length),
     rows, byChannel, best, trend: [...trend.values()].sort((a, b) => a.date.localeCompare(b.date)),

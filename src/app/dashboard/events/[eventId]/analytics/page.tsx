@@ -1,17 +1,24 @@
-import { requireEvent } from "@/lib/supabase";
+import { admin, requireEvent } from "@/lib/supabase";
+import { buildInsights } from "@/lib/insights";
 import { loadEventStats } from "@/lib/stats";
-import { fmtPct } from "@/lib/utils";
+import { daysUntil, fmtPct } from "@/lib/utils";
 import { Stat } from "@/components/ui";
-import { ChannelChart, TrendChart } from "@/components/charts";
+import { ChannelChart, FunnelChart, TrendChart } from "@/components/charts";
 
 export default async function Analytics({ params, searchParams }: PageProps<"/dashboard/events/[eventId]/analytics">) {
   const { eventId } = await params;
   const sp = await searchParams;
-  await requireEvent(eventId);
+  const { event } = await requireEvent(eventId);
   const from = String(sp.from ?? ""), to = String(sp.to ?? ""), link = String(sp.link ?? "");
   const { links, summary: s } = await loadEventStats(eventId, { from: from || undefined, to: to || undefined, linkId: link || undefined });
+  const { data: fb } = await admin().from("event_feedback").select("rating").eq("event_id", eventId);
+  const avg = fb?.length ? fb.reduce((a, b) => a + b.rating, 0) / fb.length : null;
+  const insights = buildInsights(s, { capacity: event.capacity, daysToStart: daysUntil(event.starts_at), avgRating: avg, feedbackCount: fb?.length ?? 0 });
+  const tone = { good: "bg-green-50 text-green-800", warn: "bg-amber-50 text-amber-800", info: "bg-slate-50 text-slate-700" };
   return (
     <div className="space-y-5">
+      <div className="card space-y-2"><h3 className="font-medium">Insights</h3>
+        {insights.map((i, k) => <p key={k} className={`rounded-lg px-3 py-2 text-sm ${tone[i.tone]}`}>{i.text}</p>)}</div>
       <form className="flex flex-wrap items-end gap-2">
         <div><label className="label">From</label><input type="date" name="from" defaultValue={from} className="input" /></div>
         <div><label className="label">To</label><input type="date" name="to" defaultValue={to} className="input" /></div>
@@ -22,7 +29,7 @@ export default async function Analytics({ params, searchParams }: PageProps<"/da
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Stat label="Clicks" value={s.clicks} hint="Visits to tracked links, not unique people" />
         <Stat label="Page visits" value={s.visits} hint="Event pages loaded (all traffic)" />
-        <Stat label="Registrations" value={s.confirmed} hint={`${s.cancelled} cancelled`} />
+        <Stat label="Registrations" value={s.confirmed} hint={`${s.waitlisted} waitlisted · ${s.cancelled} cancelled`} />
         <Stat label="Checked in" value={s.checkedIn} />
         <Stat label="Click → registration" value={fmtPct(s.clickToReg)} hint="Attributed registrations ÷ clicks" />
         <Stat label="Attendance rate" value={fmtPct(s.attendance)} hint="Checked in ÷ confirmed registrations" />
@@ -33,6 +40,8 @@ export default async function Analytics({ params, searchParams }: PageProps<"/da
         <strong>Best campaign: </strong>
         {s.best ? `${s.best.name} — ${fmtPct(s.best.conversion)} conversion (${s.best.registrations} registrations from ${s.best.clicks} clicks)` : "Not enough data yet (needs a campaign with at least 5 clicks)."}
       </div>
+      <div className="card"><h3 className="mb-3 font-medium">Funnel</h3>
+        {s.clicks + s.confirmed > 0 ? <FunnelChart data={[{ stage: "Link clicks", value: s.clicks }, { stage: "Page visits", value: s.visits }, { stage: "Registrations", value: s.confirmed }, { stage: "Checked in", value: s.checkedIn }]} /> : <p className="py-8 text-center text-sm text-slate-500">No data yet.</p>}</div>
       <div className="grid gap-4 lg:grid-cols-2">
         <div className="card"><h3 className="mb-3 font-medium">Clicks vs registrations by channel</h3>
           {s.byChannel.length ? <ChannelChart data={s.byChannel} /> : <p className="py-10 text-center text-sm text-slate-500">No data yet.</p>}</div>

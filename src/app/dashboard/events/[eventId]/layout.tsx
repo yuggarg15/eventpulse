@@ -4,7 +4,7 @@ import { EventTabs } from "@/components/event-tabs";
 
 export default async function EventLayout({ children, params }: LayoutProps<"/dashboard/events/[eventId]">) {
   const { eventId } = await params;
-  const { event } = await requireEvent(eventId);
+  const { event, role } = await requireEvent(eventId, true);
   return (
     <div className="space-y-5">
       <div>
@@ -14,7 +14,7 @@ export default async function EventLayout({ children, params }: LayoutProps<"/da
           <span className="badge capitalize">{event.status}</span>
         </div>
       </div>
-      <EventTabs />
+      <EventTabs role={role} />
       {children}
     </div>
   );
