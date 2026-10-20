@@ -1,5 +1,6 @@
 import { createServerClient } from "@supabase/ssr";
 import { createClient } from "@supabase/supabase-js";
+import { cache } from "react";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 
@@ -24,10 +25,11 @@ export async function authClient() {
   });
 }
 
-export async function getUser() {
+// cache(): the login check runs once per request, however many layouts/pages ask for it.
+export const getUser = cache(async () => {
   const { data } = await (await authClient()).auth.getUser();
   return data.user;
-}
+});
 
 export async function requireUser() {
   const user = await getUser();
@@ -36,12 +38,12 @@ export async function requireUser() {
 }
 
 // Returns the event only if it belongs to the signed-in user.
-export async function requireEvent(eventId: string) {
+export const requireEvent = cache(async (eventId: string) => {
   const user = await requireUser();
   const { data } = await admin().from("events").select("*").eq("id", eventId).eq("owner_id", user.id).maybeSingle();
   if (!data) redirect("/dashboard");
   return { user, event: data as EventRow };
-}
+});
 
 export type EventRow = {
   id: string; owner_id: string; slug: string; title: string; description: string; category: string;

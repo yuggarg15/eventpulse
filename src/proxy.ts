@@ -14,8 +14,10 @@ export async function proxy(req: NextRequest) {
       },
     },
   });
-  const { data } = await supabase.auth.getUser();
-  if (!data.user && req.nextUrl.pathname.startsWith("/dashboard")) {
+  // getSession reads the cookie locally (no network call) and refreshes it when expired.
+  // Real verification happens once per request in getUser(), used by the pages.
+  const { data } = await supabase.auth.getSession();
+  if (!data.session && req.nextUrl.pathname.startsWith("/dashboard")) {
     return NextResponse.redirect(new URL("/login", req.url));
   }
   return res;
